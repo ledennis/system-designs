@@ -368,3 +368,98 @@ Throughput vs capacity: the 10 MB cache sizing was bytes per second, not bytes h
 Precise vocabulary: “database lookup by short code” instead of “an algorithm,” and “rate limit” instead of “authorize.”
 Failure walkthroughs: for each component (load balancer, data, coordinator), ask where it lives when the failure happens.
 Open item: you never answered the 301 vs 302 question. Give it a try: which would you choose, and what do you give up?
+
+# Summary of the Summary
+
+## Interview flow
+1. Clarify requirements (3-5 min)
+2. Estimate (3-5 min)
+3. High-level design (10 min)
+4. Deep dive (10-15 min)
+5. Bottlenecks and trade-offs (5 min)
+
+It's more a conversation than a right/wrong quiz. Explain the reasoning behind each choice and its trade-offs.
+
+## 1. Requirements
+- **Agreed scope:** API-based (the landing page just calls the API), 100M new URLs/month (~3M/day), reads ~100x writes, 5-year default expiry (optional shorter), expired links return an error, anonymous creation with per-IP rate limiting.
+- **Non-functional:** p99 redirect under ~100 ms, 99.99% availability, favor latency/availability over strict consistency. Never allow a wrong redirect or duplicate code, and never lose a returned link.
+- **Takeaway:** Ask questions that change the architecture (QPS, DB type, caching, consistency, analytics). Use the checklist: Create, Read, Update/Delete, Users/Auth, Analytics, Abuse.
+- **To do:** Make a doc on requirement branches.
+
+## 2. Estimates
+
+| Item | Correct value | My error |
+|---|---|---|
+| Writes | ~40/sec avg | OK |
+| Reads | ~4,000/sec avg | Said 40,000 (multiplied wrong) |
+| Peak | 2-5x average (~200 writes, ~20K reads) | Didn't know how |
+| Storage | ~600 GB/yr, ~3 TB over 5 yrs | Said 300 TB (skipped the bytes→KB step) |
+
+Lessons: use 1000 rather than 1024, use 86,400 sec/day, write out the unit ladder, and sanity-check that numbers are plausible.
+
+## 3. High-level design
+- **Mistakes:**
+  - Said "short URL to original URL algorithm" (it's a DB lookup by code).
+  - Said "authorize" (it's rate limiting).
+  - Didn't name the DB or the record.
+- **Missing:**
+  - Expired/not-found handling (404/410).
+  - 301 vs 302.
+  - Load balancer.
+- **Fixes:**
+  - Use cache-aside by default.
+  - Send analytics through a queue.
+  - Record: `short_code, long_url, created_at, expires_at`.
+
+## 4. Code length
+- Alphabet = 26 + 26 + 10 = **62** (add, don't multiply).
+- 62⁶ ≈ 56.8B and 62⁷ ≈ 3.5T. Six billion links need at least 6 characters, and 7 gives headroom (~0.2% full).
+
+## 5. Deep dive
+
+### Code generation
+- **Hashing:** deterministic, so identical URLs get identical codes. Truncation causes collisions, so you need check-and-retry with a salt. No coordination needed.
+- **Counter:** no collisions, but it needs a coordinator and is predictable.
+- **My pick:** the counter approach, with:
+  - Block leasing (1M IDs per server).
+  - A keyed reversible permutation, such as a Feistel network, so codes aren't guessable.
+  - Base-62 encoding.
+- **Hardening:**
+  - Replicated coordinator that persists its high-water mark before issuing a block.
+  - Restarted servers always take a fresh block.
+  - Prefetch the next block.
+  - Keep a DB uniqueness constraint as a safety net.
+- **When to switch to hashing:** if dedup is wanted or zero coordination is needed.
+
+### Database and cache
+- **DynamoDB:** pure key-value access, horizontal scale, native TTL (lazy, so still check `expires_at`), conditional writes. Acknowledge SQL would also work.
+- **Redis (LRU):** cache size = avg reads/day × 20% × record size ≈ **35 GB**. My 10 MB figure was throughput, not capacity.
+- **If the cache goes down:** the risk is a cold-cache stampede (mitigate with replication, DB headroom, and request coalescing) and hot keys (add an in-process cache).
+
+## 6. Bottlenecks
+- **10x scale:**
+  - Shard the cache (Redis Cluster / consistent hashing).
+  - Scale the app tier horizontally.
+  - Watch the cache hit ratio, since it determines DB load.
+  - Handle hot keys.
+  - Writes, storage, and the 7-character keyspace all still hold.
+- **Region failure:**
+  - Global DNS failover above the load balancer.
+  - Cross-region replication (Global Tables, async, so recent links are at risk).
+  - N+1 capacity.
+  - Disjoint ID ranges per region with a replicated coordinator.
+- **Habit:** Ask "where does this component live when the failure happens?" Think horizontal scaling plus regional failover whenever load grows.
+
+## Debrief
+- **Strengths:**
+  - Committed to a design and defended it.
+  - Kept analytics and rate limiting off the redirect path.
+  - Tied answers to real experience (CSRMS outage, GFS Hub queue).
+  - Asked good clarifying questions.
+- **To improve:**
+  - Arithmetic and units.
+  - Throughput vs capacity.
+  - Precise vocabulary.
+  - Failure walkthroughs.
+  - Be more descriptive even when tired.
+- **Open item:** Answer 301 vs 302. With analytics and expiring links, 302 is the likely pick: every click reaches the service, at the cost of more traffic.
