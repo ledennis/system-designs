@@ -463,3 +463,45 @@ Lessons: use 1000 rather than 1024, use 86,400 sec/day, write out the unit ladde
   - Failure walkthroughs.
   - Be more descriptive even when tired.
 - **Open item:** Answer 301 vs 302. With analytics and expiring links, 302 is the likely pick: every click reaches the service, at the cost of more traffic.
+
+Common choices
+
+MurmurHash3 / xxHash: fastest, great distribution. Good default.
+MD5 or SHA-256: slower, but available in every standard library. Fine here because nobody is attacking the hash; you only need even distribution.
+CRC32: too small (32 bits), so collisions show up fast.
+
+How you turn it into a short code
+
+Hash the long URL (e.g. SHA-256 gives 256 bits, MD5 gives 128).
+Take the first N bits or bytes of the digest.
+Base62-encode them to get the code.
+
+For a 7-character code, you need about 62⁷ ≈ 3.5 trillion possible values, which is roughly 42 bits. So you’d take the first ~6 bytes of the digest, convert to an integer, and encode it as base62 (or take the first 7 base62 characters).
+
+The collision problem
+
+Truncating throws away bits, so two different URLs can map to the same code. By the birthday bound, with a 42-bit space you start seeing collisions around √(3.5 trillion) ≈ 2 million URLs. That’s tiny for a real service.
+
+Standard fix:
+
+Compute the code from the hash.
+Check the database for that code.
+If it exists and points to a different URL, append a salt (a counter or random string) to the URL, rehash, and retry.
+If it exists and points to the same URL, just return the existing code (free deduplication).
+
+Hashing tricks worth mentioning
+
+Same URL gives same code: a deterministic hash dedupes automatically, which a counter-based approach doesn’t do.
+Per-user codes: hash userId + URL if different users should get different short links for the same destination.
+Salting for retries: hash URL + attempt_number, incrementing on each collision.
+
+What to tighten
+1. Reducing a hash to 7 characters. Truncate to 5 bytes, or take the value modulo 62^7 and pad. Seven base-62 characters hold about 41.7 bits, so 48 bits doesn't fit. The first explanation of this in the session was misleading, so that confusion wasn't yours.
+2. Terminology. A conditional write is an atomic check-and-set, not idempotent. The cache inside the service is an in-process (local) cache. The cross-region database feature is DynamoDB global tables.
+3. Sizing the local cache. It should be small (hundreds of MB), sized by what's hot, not as a fraction of Redis. Check any size against the actual machine.
+4. The rate for daily volume. Use the average rate, not peak, when you work out a day's reads. You corrected this when asked, and the next step is to do it the first time.
+5. Failover. Retries have to come from outside the failed region (client or global routing), with jitter, and DNS caching means some traffic keeps hitting the dead region briefly. You covered the empty caches and the cost, which many people forget.
+6. The 10x question. Name everything that grows, not just the cache: the app tier scales out, DynamoDB capacity and hot partitions, and the write path. The key space is still fine at 7 characters (about 55B links is under 2% of it).
+7. Commit to a code-generation approach during the high-level design. You did, and this time there was no gap.
+Compared with the first attempt
+The arithmetic and unit errors that dominated the first time are mostly gone. You committed to design choices early, asked better requirements questions, and made no write-back versus cache-aside mix-up. What's left is detail: bit-level reductions, naming mechanisms precisely, and failure walkthroughs. Those come from repetition, not from a gap in how you think.
