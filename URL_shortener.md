@@ -505,3 +505,30 @@ What to tighten
 7. Commit to a code-generation approach during the high-level design. You did, and this time there was no gap.
 Compared with the first attempt
 The arithmetic and unit errors that dominated the first time are mostly gone. You committed to design choices early, asked better requirements questions, and made no write-back versus cache-aside mix-up. What's left is detail: bit-level reductions, naming mechanisms precisely, and failure walkthroughs. Those come from repetition, not from a gap in how you think.
+
+Debrief: Rate Limiter (redo)
+The 5-minute version
+
+Requirements. 100 requests per client per minute, firm but with about 10% tolerance. 429 with Retry-After on rejection. About 1M requests/sec at peak, about 1M active clients per minute, and the client base doubling next year. Latency budget of a few milliseconds, and the limiter must not take the API down, so it fails open.
+
+Estimates. At about 100K ops/sec per Redis node and two operations per check, a node does about 50K checks/sec. 1M / 50K is 20 nodes at exactly peak, so I’d run with headroom (about 40 at 50% utilization) plus a replica for each. State is about 100 bytes per client, so about 5 MB per node. The nodes exist for throughput, not memory.
+
+Design. The API gateway verifies the token locally and hashes the client ID with consistent hashing to pick a counter node. The node runs a token bucket with lazy refill in an atomic Lua script, with capacity 10 and refill 1.67 tokens per second (worst case about 110 per minute). It answers allowed or rejected and doesn’t touch the traffic. The gateway then forwards the request to the API service or returns a 429 with Retry-After itself, so rejected requests never reach the API fleet. Records expire shortly after a bucket would refill completely.
+
+Failure and scale. Each node has a replica. If a node and its replica both die, gateways fail open with a local counter, and remove the node from the ring so its clients rehash onto survivors. A heavy client gets blocked at the gateway until its retry-after time passes, with per-IP limits at the edge. Capacity grows by adding nodes.
+
+What went well
+Your requirements were thorough. You covered clients, limit and window, peak traffic, rejection behavior, hard vs. soft, scaling, latency vs. consistency, and what the limit is based on. You also proposed the fail-open fallback yourself.
+The estimation was correct. 1M / 50K = 20, the state came out right at 5 MB per node, and you planned for replicas and doubling.
+You reasoned your way to a better design. You moved the limiter off the data path so it only answers checks, and then moved the check before the API service so rejected requests don’t cost the fleet anything. Both came from asking what a rejected request costs.
+You tuned the token bucket to the requirement. You found that capacity 20 with refill 1.5 would throttle a compliant client at 90 per minute, and you fixed it to capacity 10 with refill 1.67.
+The deep dive was sound. Lazy refill, an atomic Lua script for the race, and the point that an idle client’s bucket looks the same as a new one.
+Compared with the first attempt, the earlier problems are gone: no coordinator in the request path, no lock, no 1,000x state error, and no mismatched burst parameters.
+What to tighten
+Why there are 20 nodes. It’s throughput (1M / 50K), not latency, availability, or hot nodes. Headroom is a separate decision: pick a utilization target (about 50% is common) and say why.
+Put the limiter off the data path from the start. Your first design had the limiter fetching the response from the API server. Say “the limiter answers checks and nothing else” up front.
+Worst-case arithmetic. Worst case per window is capacity plus refill times the window. 120 + 100 is 220, not 210. Use that formula every time.
+The script’s order of steps. Elapsed time is now - last_time, check for at least one token before subtracting, and return the retry time on a rejection.
+Unit slips. “100 per second” instead of per minute came up once. Read the number back against the requirement.
+Dead node pair. Rehash its clients onto surviving nodes instead of staying failed-open for the whole outage.
+Hot client. Say that the first requests still reach the node, so the gateway block must start at the first rejection, and add edge limits above it.
