@@ -20,6 +20,7 @@ The interview ran through requirements, estimation, and the high-level design. T
 12. The 5-minute version
 13. Additions from the redo
 14. Record states and how each is handled
+15. Additions from the third run
 
 ---
 
@@ -713,3 +714,99 @@ claim key + save record
 | `QUEUED` for too long | Lag alerts, and the delivery TTL for time-sensitive messages |
 | `SENT` with no callback | A timeout policy you choose (leave it, or mark it unknown) |
 | `FAILED` | The DLQ alert, then manual replay, which sets it back to `QUEUED` |
+
+---
+
+# 15. Additions from the third run
+
+This section adds what came up in the third run of this interview. Where it differs from an earlier section, treat this section as the more specific version.
+
+## How campaigns and channels work
+
+- A publisher's request names the **audience** (or a single user), the **message**, and the **channels it may use**. A campaign is typically sent on one channel (an email promotion) or two (push plus email), not on everything.
+- Preferences are applied **per user, per requested channel**: the system sends only on channels the user has opted into for that category. A user who opted out of every requested channel gets nothing, and the skip is recorded.
+- Each user and channel pair is its own notification, with its own record, provider call, and retries. The 50 million a day and the 70/25/5 split already include this fan-out.
+- Automatic fallback from one channel to another (SMS if push fails) was out of scope. Each channel is independent.
+- Say where the expansion of one campaign request into per-user notifications happens (the expansion job from section 13).
+
+## Per-channel peaks, and why they matter
+
+- At 5x: about 2,030 push, 725 email, and 145 SMS per second, adding up to about 2,900.
+- If every channel is multiplied by the same factor, the total and the storage don't change. Per-channel numbers still matter because each channel has its own provider and rate limit, its own queue, and its own worker pool, and channels don't always peak together (a marketing email blast spikes email while SMS stays flat). A flat 5x per channel is a simplification, so say it's an assumption.
+
+## Email dominates the storage
+
+| | Share of notifications | Share of the 7-day content | Share of everything stored |
+|---|---|---|---|
+| Push | 70% | about 12% | about 43% |
+| Email | 25% | about 87% | about 54% |
+| SMS | 5% | about 0.4% | about 3% |
+
+Email is a quarter of the traffic and about 87% of the content storage. Over everything stored it's about half, because the 90-day metadata is the same size for every notification, so push (the most notifications) carries most of that. At this size, one design for all three channels is workable. If you did handle email differently, it would be in the content store (for example keeping a template ID and parameters instead of rendered HTML), at the cost of rendering again when you need the content.
+
+## Keys, records, and the 202
+
+- The **idempotency keys** expire after **24 hours**, longer than any realistic retry window.
+- The **notification records** follow their own retention: 90 days for metadata and 7 days for content. Keep the key inside the notification record so the two are linked.
+- Create the **notification ID at intake**, not later in a worker. The 202 returns the stored metadata and that ID, so the publisher has something to identify its notification by, and a retry that finds the key can return the same thing. The same ID is used all the way to the provider as the dedupe key.
+- A retry within 24 hours finds the key and gets the original record back. A retry after the key has expired would create a new notification, which is the trade-off of choosing a TTL.
+- The 202 is returned only after the record is written, so "accepted" means it won't be lost.
+
+## Finding records that never got queued
+
+A query for `WHERE status = 'PENDING'` doesn't work well in Cassandra, because `status` isn't part of the key. It means scanning, or a secondary index on a low-cardinality column that changes constantly, which is an anti-pattern. Two fixes that work together:
+
+1. **Keep the poller out of the main path.** After writing the record, the service publishes to the queue right away and marks it `QUEUED`. Critical notifications wait on nothing. Pending records are the exception.
+2. **A sweeper table as a safety net.** When a record is created, also insert a row into a table partitioned by a time bucket (for example the minute), with the notification ID as the clustering column. When the message is queued, delete or expire the row. The sweeper reads buckets older than a short threshold and republishes whatever is left. That's a read of a known partition, not a scan. A one-minute bucket holds about 35,000 rows at the average rate (about 174,000 at peak), so add a shard suffix or split by priority.
+
+Use a threshold of seconds for critical and longer for bulk. Republishing is safe because delivery is idempotent on the notification ID.
+
+## The bulk lane and the provider's quota
+
+- Critical and bulk have **separate queues and worker pools**, so a password reset doesn't wait behind a 5-million-user campaign.
+- Both lanes call the same provider, which has one rate limit across everything we send. So cap the bulk lane at a share of the provider's quota (50% is a reasonable starting point) so critical traffic always has room. Better: make it adaptive, the provider quota minus live critical and normal usage.
+- With 40 bulk workers that can't see each other, send them all through a **shared limiter** (a token bucket in front of the provider), the same idea as the rate limiter design, applied to the provider instead of a user.
+- A "no, not now" from the limiter is **not a failed send**. Don't count it against the 5 attempts, or a campaign waiting for quota could push thousands of healthy messages into the DLQ. Have the limiter return a wait time, and have the worker hold the message until then.
+
+## A worker crash after the provider accepts
+
+1. A worker sends a push, the provider accepts, and the worker crashes before recording `SENT`.
+2. The message was never acknowledged, so the queue redelivers it to another worker after a timeout.
+3. The retry uses the same notification ID, so a provider that dedupes on an ID recognizes the repeat.
+4. If the provider doesn't support dedupe, a rare duplicate is possible. Say so, and accept it for most notifications.
+5. It matters more for things that are costly or confusing to send twice (an SMS is billed per message, or a "you've been charged" message). For those, prefer a provider that dedupes on an ID, or shrink the window by recording that you're about to send before you call the provider.
+
+An idempotency key prevents duplicate **creation**. It doesn't make delivery "at least once." The queue gives at-least-once delivery, and the key plus the notification ID turn that into an effectively-once result.
+
+## Scale at 10x
+
+- About 5,800 per second on average and about 29,000 per second at a 5x peak (500 million a day).
+- Storage: about 22.5 TB of metadata plus about 20 TB of content, about 42.5 TB, about 127.5 TB with three copies, about 64 nodes at 2 TB each.
+- The **provider limits** break first, since you can't add servers to a third party. Scale workers and Cassandra, and ask the providers for higher limits.
+- The conditional write for the idempotency key now runs about 29,000 times per second at peak and is slower than a normal write. Watch it.
+
+## Region failure
+
+- Replicate Cassandra to a second region, with service nodes standing by there, and switch traffic on failure.
+- The idempotency keys live in Cassandra, so replication carries them too. The gap is **replication lag**: cross-region replication is asynchronous, so records and keys written in the last moments before the failure might not have arrived. A conditional write can only reject a duplicate for a key the second region already has, so for those few keys a publisher's retry could create a second notification. Say it as a known trade-off.
+- Notifications that were in the failed region's queues are recovered from the database: records still saying `QUEUED` that never moved on. Use a sweeper with a threshold by priority (seconds to a minute for critical, longer for bulk, not an hour), and run a recovery pass over those records **as soon as traffic switches**.
+- Some of them may have been sent just before the crash without the status being updated, so provider-side dedupe covers it, and a rare duplicate is the accepted cost.
+
+## What a real round looks like
+
+- It's **time-boxed**: usually 45 to 60 minutes in total, with the design itself about 35 to 50 minutes.
+- The deep dive is short: the interviewer picks one or two areas and spends about 10 to 15 minutes on them, usually a handful of questions, not chain after chain.
+- A reasonable answer gets a move to the next topic, and if you're stuck, they give a hint or move on.
+- You can steer: "I've covered the main flow, so would you like me to go deeper on retries or on campaigns?"
+- The same building blocks keep coming back. Across the four problems so far: idempotency keys, queue plus workers, consistent hashing, retries with backoff, conditional writes, caching, and a replicated key-value store. A new problem is mostly a recombination of those.
+- A real round expects clear requirements, a sensible estimate, a clean design, and the main trade-offs in your own words. "A conditional insert that only succeeds if the key doesn't exist" is a full answer without the Cassandra name.
+
+## Slips from the third run to watch for
+
+1. Arithmetic under pressure (580 x 5). Write the multiplication out.
+2. Saying an idempotency key ensures "at least once." It prevents duplicate creation, and the queue provides at-least-once delivery.
+3. Creating the notification ID in a worker instead of at intake.
+4. Polling on a column that isn't part of the Cassandra key.
+5. Counting a limiter's "wait" against the retry limit.
+6. Saying the new region "won't have the idempotency keys." They replicate, and the gap is replication lag.
+7. A sweeper threshold of an hour for everything, instead of by priority.
